@@ -1,0 +1,15 @@
+# Ignore everything.
+/*
+
+# Provide an allowlist.
+!.gitignore
+
+!README.md
+!LICENSE-APACHE
+!LICENSE-MIT
+
+!Cargo.lock
+!Cargo.toml
+
+!src/
+
