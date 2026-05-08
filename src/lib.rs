@@ -4,6 +4,15 @@ use core::ptr::NonNull;
 
 use core::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(any(feature = "alloc", test))]
+mod allocated;
+
+#[cfg(any(feature = "alloc", test))]
+pub use allocated::*;
+
 /// A lockless ringbuffer implementation intended for logging.
 pub struct Ringbuffer<M: Metadata> {
     data_capacity: usize,
