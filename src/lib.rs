@@ -1,8 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 
-use core::{hint::cold_path, ptr::NonNull};
+use core::{hint::cold_path, mem, ptr::NonNull, slice};
 
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -12,6 +12,8 @@ mod allocated;
 
 #[cfg(any(feature = "alloc", test))]
 pub use allocated::*;
+
+const BASE_SEQUENCE: u64 = 0;
 
 /// A lockless ringbuffer implementation intended for logging.
 pub struct Ringbuffer<M: Metadata> {
@@ -42,8 +44,7 @@ impl<M: Metadata> Ringbuffer<M> {
         assert!(descriptor_count != 0 && descriptor_count.is_power_of_two());
 
         let starting_logical_position = usize::MAX.wrapping_sub(data_capacity).wrapping_add(1);
-        let starting_descriptor_id =
-            DescriptorId::new_truncating(usize::MAX.wrapping_sub(descriptor_count).wrapping_add(1));
+        let starting_descriptor_id = DescriptorId::base_id(descriptor_count);
 
         Self::initialize_descriptor_buffer(descriptor_buffer, descriptor_count);
 
@@ -58,7 +59,7 @@ impl<M: Metadata> Ringbuffer<M> {
             metadata_buffer,
             descriptor_id_start: AtomicDescriptorId::new(starting_descriptor_id),
             descriptor_id_end: AtomicDescriptorId::new(starting_descriptor_id),
-            last_finalized_sequence: AtomicU64::new(0),
+            last_finalized_sequence: AtomicU64::new(BASE_SEQUENCE),
 
             empty: AtomicBool::new(true),
         }
@@ -66,8 +67,8 @@ impl<M: Metadata> Ringbuffer<M> {
 
     const fn initialize_descriptor_buffer(buffer: NonNull<Descriptor>, count: usize) {
         let mut index = 0;
-        let mut id = DescriptorId::new_truncating(usize::MAX.wrapping_sub(count).wrapping_add(1));
-        let mut sequence = u64::MAX.wrapping_sub(count as u64).wrapping_add(1);
+        let mut id = DescriptorId::base_id(count);
+        let mut sequence = BASE_SEQUENCE.wrapping_sub(count as u64);
         while index < count {
             let ptr = unsafe { buffer.add(index) };
 
@@ -93,7 +94,145 @@ impl<M: Metadata> Ringbuffer<M> {
     ///
     /// The returned buffer may be greater than or equal to `size`.
     pub fn reserve(&self, size: usize) -> Option<ReservedMessage<'_, M>> {
-        todo!()
+        let block_size = size
+            .checked_add(mem::size_of::<usize>())?
+            .checked_next_multiple_of(mem::align_of::<usize>())?;
+
+        if size != 0 && block_size > self.data_capacity / 2 {
+            return None;
+        }
+
+        let mut current_id = self.descriptor_id_start.load(Ordering::Acquire);
+        let mut id;
+        let mut previous_wrap_id;
+        let (id, previous_wrap_id) = loop {
+            id = current_id.next();
+            previous_wrap_id = id.prev_wrap(self.descriptor_count);
+
+            if previous_wrap_id == self.descriptor_id_end.load(Ordering::Acquire) {
+                todo!()
+            }
+
+            let result = self.descriptor_id_start.compare_exchange(
+                current_id,
+                id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            match result {
+                Ok(_) => break (id, previous_wrap_id),
+                Err(updated_current_id) => current_id = updated_current_id,
+            }
+        };
+
+        let descriptor = self.descriptor(id);
+
+        let current_state_id =
+            DescriptorStateId::new(previous_wrap_id, DescriptorState::MissingData);
+        let new_state_id = DescriptorStateId::new(id, DescriptorState::Reserved);
+        if descriptor
+            .state_id
+            .compare_exchange(
+                current_state_id,
+                new_state_id,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            // TODO: Handle ABA error
+            return None;
+        }
+
+        let current_seq = descriptor.sequence.load(Ordering::Relaxed);
+        descriptor.sequence.store(
+            current_seq.wrapping_add(self.descriptor_count as u64),
+            Ordering::Relaxed,
+        );
+
+        let prev_id = id.prev();
+        let prev_descriptor = self.descriptor(prev_id);
+        if prev_descriptor
+            .state_id
+            .compare_exchange(
+                DescriptorStateId::new(prev_id, DescriptorState::Committed),
+                DescriptorStateId::new(prev_id, DescriptorState::Finalized),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.update_last_finalized();
+        }
+
+        let (logical_start, logical_end, block) = if size == 0 {
+            let logical_start = self.logical_start.load(Ordering::Acquire);
+
+            (logical_start, logical_start, None)
+        } else {
+            let mut logical_start = self.logical_start.load(Ordering::Acquire);
+
+            let logical_end = loop {
+                let logical_end = logical_start.wrapping_add(block_size);
+                let logical_end = if logical_start >> self.data_capacity.trailing_zeros()
+                    == logical_end >> self.data_capacity.trailing_zeros()
+                {
+                    logical_end
+                } else {
+                    (logical_end >> self.data_capacity.trailing_zeros()
+                        << self.data_capacity.trailing_zeros())
+                        + block_size
+                };
+
+                let result = self.logical_start.compare_exchange(
+                    logical_start,
+                    logical_end,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                match result {
+                    Ok(_) => break logical_end,
+                    Err(new_logical_start) => logical_start = new_logical_start,
+                }
+            };
+
+            let mut block = self.data(logical_start);
+            unsafe { block.cast::<usize>().write(id.to_raw()) };
+
+            if logical_start >> self.data_capacity.trailing_zeros()
+                != logical_end >> self.data_capacity.trailing_zeros()
+            {
+                block = self.data(0);
+                unsafe { block.cast::<usize>().write(id.to_raw()) };
+            }
+
+            let block = unsafe { block.add(mem::size_of::<usize>()) };
+            (logical_start, logical_end, Some(block))
+        };
+
+        descriptor
+            .logical_start
+            .store(logical_start, Ordering::Release);
+        descriptor.logical_end.store(logical_end, Ordering::Release);
+
+        let buffer = if let Some(block) = block {
+            unsafe {
+                slice::from_raw_parts_mut(
+                    block.as_ptr(),
+                    block_size.strict_sub(mem::size_of::<usize>()),
+                )
+            }
+        } else {
+            &mut []
+        };
+
+        let message = ReservedMessage {
+            ringbuffer: self,
+            sequence: descriptor.sequence.load(Ordering::Relaxed),
+            buffer,
+        };
+
+        Some(message)
     }
 
     /// Non-blocking read of the requested [`Message`] or (if the requested [`Message`] is gone, the
@@ -107,12 +246,12 @@ impl<M: Metadata> Ringbuffer<M> {
     }
 
     /// Returns the oldest sequence number still in this [`Ringbuffer`].
-    ///
+    //
     /// This sequence number may correspond to log messages with only their metadata remaining.
     pub fn first_sequence(&self) -> u64 {
         if self.empty.load(Ordering::Relaxed) {
             cold_path();
-            return 0;
+            return BASE_SEQUENCE;
         }
 
         loop {
@@ -140,10 +279,41 @@ impl<M: Metadata> Ringbuffer<M> {
     pub fn first_valid_sequence(&self) -> u64 {
         if self.empty.load(Ordering::Relaxed) {
             cold_path();
-            return 0;
+            return BASE_SEQUENCE;
         }
 
-        todo!()
+        let mut sequence = BASE_SEQUENCE;
+        loop {
+            let expected_id = DescriptorId::new_truncating(sequence as usize);
+
+            let descriptor = self.descriptor(expected_id);
+
+            let start_state_id = descriptor.state_id.load(Ordering::Acquire);
+
+            let loaded_sequence = descriptor.sequence.load(Ordering::Acquire);
+
+            let end_state_id = descriptor.state_id.load(Ordering::Relaxed);
+            if start_state_id != end_state_id {
+                continue;
+            };
+
+            if end_state_id == DescriptorStateId::new(expected_id, DescriptorState::Finalized)
+                && loaded_sequence == sequence
+            {
+                return sequence;
+            }
+
+            let first_sequence = self.first_sequence();
+            if sequence < first_sequence {
+                sequence = first_sequence;
+            } else if end_state_id
+                == DescriptorStateId::new(expected_id, DescriptorState::MissingData)
+            {
+                sequence = sequence.wrapping_add(1);
+            } else {
+                return 0;
+            };
+        }
     }
 
     /// Returns the sequence number by which the next log message in this [`Ringbuffer`] will be
@@ -151,7 +321,7 @@ impl<M: Metadata> Ringbuffer<M> {
     pub fn next_sequence(&self) -> u64 {
         if self.empty.load(Ordering::Relaxed) {
             cold_path();
-            return 0;
+            return BASE_SEQUENCE;
         }
 
         let sequence = self.last_finalized_sequence.load(Ordering::Relaxed);
@@ -162,15 +332,46 @@ impl<M: Metadata> Ringbuffer<M> {
     /// [`Ringbuffer`] will be referred.
     pub fn next_reserve_sequence(&self) -> u64 {
         loop {
-            let mut last_finalized = self.last_finalized_sequence.load(Ordering::Acquire);
-            let mut descriptor_id_start = self.descriptor_id_start.load(Ordering::Relaxed);
+            let last_finalized_sequence = self.last_finalized_sequence.load(Ordering::Acquire);
+            let descriptor_id_start = self.descriptor_id_start.load(Ordering::Relaxed);
 
             let descriptor = self.descriptor(descriptor_id_start);
-            let last_finalized_id = descriptor.state_id.load(Ordering::Relaxed).id();
 
+            let start_state_id = descriptor.state_id.load(Ordering::Acquire);
 
+            let sequence = descriptor.sequence.load(Ordering::Acquire);
+
+            let end_state_id = descriptor.state_id.load(Ordering::Acquire);
+            if start_state_id != end_state_id || end_state_id.id() != descriptor_id_start {
+                continue;
+            }
+
+            if end_state_id.state() != DescriptorState::Finalized
+                || sequence != last_finalized_sequence
+            {
+                if self.empty.load(Ordering::Relaxed) {
+                    cold_path();
+
+                    let base_id = DescriptorId::base_id(self.descriptor_count);
+                    if descriptor_id_start == base_id {
+                        return BASE_SEQUENCE;
+                    }
+
+                    return last_finalized_sequence
+                        .wrapping_add(descriptor_id_start.difference(base_id) as u64)
+                        .wrapping_add(1);
+                }
+                continue;
+            }
+
+            let difference = descriptor_id_start.difference(end_state_id.id());
+            return last_finalized_sequence
+                .wrapping_add(difference as u64)
+                .wrapping_add(1);
         }
+    }
 
+    fn update_last_finalized(&self) {
         todo!()
     }
 
@@ -180,9 +381,15 @@ impl<M: Metadata> Ringbuffer<M> {
         let ptr = unsafe { self.descriptor_buffer.add(index) };
         unsafe { ptr.as_ref() }
     }
+
+    fn data(&self, logical: usize) -> NonNull<u8> {
+        let index = logical % self.data_capacity;
+
+        unsafe { self.data_buffer.add(index) }
+    }
 }
 
-/// A reserved segment of the [`Ringbuffer`], along with
+/// A reserved segment of the [`Ringbuffer`].
 pub struct ReservedMessage<'buffer, M: Metadata> {
     ringbuffer: &'buffer Ringbuffer<M>,
     sequence: u64,
@@ -223,7 +430,6 @@ pub struct CommittedMessage<'buffer, M: Metadata> {
     ringbuffer: &'buffer Ringbuffer<M>,
     sequence: u64,
     metadata: M,
-    buffer: &'buffer [AtomicU8],
 }
 
 impl<'buffer, M: Metadata> CommittedMessage<'buffer, M> {
@@ -273,6 +479,19 @@ impl AtomicDescriptorStateId {
 
     fn store(&self, id: DescriptorStateId, order: Ordering) {
         self.0.store(id.to_raw(), order);
+    }
+
+    fn compare_exchange(
+        &self,
+        current: DescriptorStateId,
+        new: DescriptorStateId,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<DescriptorStateId, DescriptorStateId> {
+        self.0
+            .compare_exchange(current.to_raw(), new.to_raw(), success, failure)
+            .map(DescriptorStateId::from_raw)
+            .map_err(DescriptorStateId::from_raw)
     }
 }
 
@@ -338,6 +557,19 @@ impl AtomicDescriptorId {
     fn store(&self, id: DescriptorId, order: Ordering) {
         self.0.store(id.to_raw(), order);
     }
+
+    fn compare_exchange(
+        &self,
+        current: DescriptorId,
+        new: DescriptorId,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<DescriptorId, DescriptorId> {
+        self.0
+            .compare_exchange(current.to_raw(), new.to_raw(), success, failure)
+            .map(DescriptorId::from_raw)
+            .map_err(DescriptorId::from_raw)
+    }
 }
 
 #[repr(transparent)]
@@ -345,33 +577,62 @@ impl AtomicDescriptorId {
 struct DescriptorId(usize);
 
 impl DescriptorId {
+    /// Creates a new [`DescriptorId`] from the raw value.
     const fn from_raw(val: usize) -> Self {
         Self(val)
     }
 
+    /// Creates a new [`DescriptorId`] from the provided value, truncating as necessary.
     const fn new_truncating(val: usize) -> Self {
         Self(val & DescriptorStateId::ID_MASK)
     }
 
+    /// Returns the previous [`DescriptorId`] in the modular representation.
+    const fn prev(self) -> Self {
+        Self::new_truncating(self.to_raw().wrapping_sub(1))
+    }
+
+    /// Returns the next [`DescriptorId`] in the modular representation.
     const fn next(self) -> Self {
         Self::new_truncating(self.to_raw().wrapping_add(1))
     }
 
+    /// Returns the [`DescriptorId`] associated with the same index, but one wrap earlier.
     const fn prev_wrap(self, descriptor_count: usize) -> Self {
         Self::new_truncating(self.to_raw().wrapping_sub(descriptor_count))
     }
 
+    /// Returns how many [`DescriptorId`]s `self` is ahead of `lhs`.
+    const fn difference(self, lhs: Self) -> usize {
+        self.to_raw().wrapping_sub(lhs.to_raw()) & DescriptorStateId::ID_MASK
+    }
+
+    /// Returns the raw representation of this [`DescriptorId`].
     const fn to_raw(self) -> usize {
         self.0
+    }
+
+    const fn base_id(descriptor_count: usize) -> Self {
+        Self::new_truncating(0usize.wrapping_sub(descriptor_count))
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DescriptorState {
+    /// The slot is empty or the data was overwritten.
     MissingData,
+    /// A producer has claimed this slot and is currently writing to it.
     Reserved,
+    /// The data is written, and the message is visible, but it might still be "reopened" for more
+    /// data.
     Committed,
+    /// The message is immutable and ready to be consumed or eventually overwritten.
     Finalized,
+}
+
+struct Block {
+    id: AtomicUsize,
+    data: [u8],
 }
 
 /// Data associated with a particular [`Message`].
@@ -391,10 +652,11 @@ pub trait Metadata: Copy {
     fn store(atomic: &Self::Atomic, val: Self, order: Ordering);
 }
 
+#[cfg(test)]
 mod test {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::{AllocatedRingBuffer, Metadata, Ringbuffer};
+    use crate::{AllocatedRingBuffer, BASE_SEQUENCE, Metadata};
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     struct TestMetadata(u64);
@@ -415,9 +677,9 @@ mod test {
     pub fn empty_buffer_sequences() {
         let buffer = AllocatedRingBuffer::<TestMetadata>::new(8, 1);
 
-        assert_eq!(buffer.first_sequence(), 0);
-        assert_eq!(buffer.first_valid_sequence(), 0);
-        assert_eq!(buffer.next_sequence(), 0);
-        assert_eq!(buffer.next_reserve_sequence(), 0);
+        assert_eq!(buffer.first_sequence(), BASE_SEQUENCE);
+        assert_eq!(buffer.first_valid_sequence(), BASE_SEQUENCE);
+        assert_eq!(buffer.next_sequence(), BASE_SEQUENCE);
+        assert_eq!(buffer.next_reserve_sequence(), BASE_SEQUENCE);
     }
 }
