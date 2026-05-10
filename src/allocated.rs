@@ -1,5 +1,10 @@
 use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use core::ptr::{self, NonNull};
+use core::{
+    mem,
+    ptr::{self, NonNull},
+};
+
+use core::sync::atomic::{AtomicU8, AtomicUsize};
 
 use crate::{Descriptor, Metadata, Ringbuffer};
 
@@ -12,7 +17,8 @@ impl<M: Metadata> AllocatedRingBuffer<M> {
         assert_ne!(data_capacity, 0);
         assert_ne!(descriptor_count, 0);
 
-        let data_layout = Layout::array::<u8>(data_capacity)
+        let data_layout = Layout::array::<AtomicU8>(data_capacity)
+            .and_then(|layout| layout.align_to(mem::align_of::<AtomicUsize>()))
             .expect("requested ringbuffer data size is too large");
         let descriptor_layout = Layout::array::<Descriptor>(descriptor_count)
             .expect("requested ringbuffer descriptor count is too large");
@@ -45,7 +51,7 @@ impl<M: Metadata> AllocatedRingBuffer<M> {
 
         let ringbuffer = Ringbuffer::new(
             data_capacity,
-            NonNull::new(data_buffer).unwrap(),
+            NonNull::new(data_buffer.cast::<AtomicU8>()).unwrap(),
             descriptor_count,
             NonNull::new(descriptor_buffer.cast::<Descriptor>()).unwrap(),
             NonNull::new(metadata_buffer.cast::<M::Atomic>()).unwrap(),
@@ -71,11 +77,13 @@ impl<M: Metadata> core::ops::DerefMut for AllocatedRingBuffer<M> {
 
 impl<M: Metadata> core::ops::Drop for AllocatedRingBuffer<M> {
     fn drop(&mut self) {
-        let data_layout = Layout::array::<u8>(self.data_capacity).unwrap();
+        let data_layout = Layout::array::<AtomicU8>(self.0.data_capacity)
+            .and_then(|layout| layout.align_to(mem::align_of::<AtomicUsize>()))
+            .unwrap();
         let descriptor_layout = Layout::array::<Descriptor>(self.descriptor_count).unwrap();
         let metadata_layout = Layout::array::<M::Atomic>(self.descriptor_count).unwrap();
 
-        unsafe { dealloc(self.data_buffer.as_ptr(), data_layout) };
+        unsafe { dealloc(self.data_buffer.as_ptr().cast::<u8>(), data_layout) };
         unsafe {
             dealloc(
                 self.descriptor_buffer.as_ptr().cast::<u8>(),

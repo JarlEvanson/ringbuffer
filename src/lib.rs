@@ -2,7 +2,7 @@
 
 use core::{hint::cold_path, mem, ptr::NonNull, slice};
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{self, AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -14,11 +14,12 @@ mod allocated;
 pub use allocated::*;
 
 const BASE_SEQUENCE: u64 = 0;
+const BASE_ID: usize = BASE_SEQUENCE as usize;
 
 /// A lockless ringbuffer implementation intended for logging.
 pub struct Ringbuffer<M: Metadata> {
     data_capacity: usize,
-    data_buffer: NonNull<u8>,
+    data_buffer: NonNull<AtomicU8>,
     logical_start: AtomicUsize,
     logical_end: AtomicUsize,
 
@@ -35,7 +36,7 @@ pub struct Ringbuffer<M: Metadata> {
 impl<M: Metadata> Ringbuffer<M> {
     pub fn new(
         data_capacity: usize,
-        data_buffer: NonNull<u8>,
+        data_buffer: NonNull<AtomicU8>,
         descriptor_count: usize,
         descriptor_buffer: NonNull<Descriptor>,
         metadata_buffer: NonNull<M::Atomic>,
@@ -43,8 +44,10 @@ impl<M: Metadata> Ringbuffer<M> {
         assert!(data_capacity != 0 && data_capacity.is_power_of_two());
         assert!(descriptor_count != 0 && descriptor_count.is_power_of_two());
 
-        let starting_logical_position = usize::MAX.wrapping_sub(data_capacity).wrapping_add(1);
-        let starting_descriptor_id = DescriptorId::base_id(descriptor_count);
+        unsafe { core::ptr::write_bytes(data_buffer.as_ptr(), 0, data_capacity) }
+
+        let starting_logical_position = 0usize.wrapping_sub(data_capacity);
+        let starting_descriptor_id = DescriptorId::base_id().prev();
 
         Self::initialize_descriptor_buffer(descriptor_buffer, descriptor_count);
 
@@ -67,7 +70,7 @@ impl<M: Metadata> Ringbuffer<M> {
 
     const fn initialize_descriptor_buffer(buffer: NonNull<Descriptor>, count: usize) {
         let mut index = 0;
-        let mut id = DescriptorId::base_id(count);
+        let mut id = DescriptorId::base_id().prev_wrap(count);
         let mut sequence = BASE_SEQUENCE.wrapping_sub(count as u64);
         while index < count {
             let ptr = unsafe { buffer.add(index) };
@@ -197,16 +200,26 @@ impl<M: Metadata> Ringbuffer<M> {
             };
 
             let mut block = self.data(logical_start);
-            unsafe { block.cast::<usize>().write(id.to_raw()) };
+            unsafe {
+                block
+                    .cast::<AtomicUsize>()
+                    .as_ref()
+                    .store(id.to_raw(), Ordering::Relaxed)
+            };
 
             if logical_start >> self.data_capacity.trailing_zeros()
                 != logical_end >> self.data_capacity.trailing_zeros()
             {
                 block = self.data(0);
-                unsafe { block.cast::<usize>().write(id.to_raw()) };
+                unsafe {
+                    block
+                        .cast::<AtomicUsize>()
+                        .as_ref()
+                        .store(id.to_raw(), Ordering::Relaxed)
+                };
             }
 
-            let block = unsafe { block.add(mem::size_of::<usize>()) };
+            let block = unsafe { block.add(mem::size_of::<AtomicUsize>()) };
             (logical_start, logical_end, Some(block))
         };
 
@@ -242,7 +255,57 @@ impl<M: Metadata> Ringbuffer<M> {
         sequence: u64,
         buffer: &'buffer mut [u8],
     ) -> Option<Message<'buffer, M>> {
-        todo!()
+        let mut sequence = sequence;
+        loop {
+            let descriptor_state = loop {
+                let expected_id = DescriptorId::new_truncating(sequence as usize);
+
+                let descriptor = self.descriptor(expected_id);
+                let metadata = self.metadata(expected_id);
+
+                let start_state_id = descriptor.state_id.load(Ordering::Acquire);
+                if start_state_id != DescriptorStateId::new(expected_id, DescriptorState::Finalized)
+                {
+                    break start_state_id;
+                }
+
+                let loaded_sequence = descriptor.sequence.load(Ordering::Relaxed);
+                let metadata = M::load(metadata, Ordering::Relaxed);
+
+                atomic::fence(Ordering::Acquire);
+
+                let end_state_id = descriptor.state_id.load(Ordering::Relaxed);
+                if start_state_id != end_state_id {
+                    continue;
+                };
+
+                if loaded_sequence != sequence {
+                    break start_state_id;
+                }
+
+                let message = Message {
+                    sequence,
+                    metadata,
+                    buffer: Some(buffer),
+                };
+
+                return Some(message);
+            };
+
+            let first_sequence = self.first_sequence();
+            if sequence < first_sequence {
+                sequence = first_sequence;
+            } else if descriptor_state
+                == DescriptorStateId::new(
+                    DescriptorId::new_truncating(sequence as usize),
+                    DescriptorState::MissingData,
+                )
+            {
+                sequence = sequence.wrapping_add(1);
+            } else {
+                return None;
+            }
+        }
     }
 
     /// Returns the oldest sequence number still in this [`Ringbuffer`].
@@ -352,7 +415,7 @@ impl<M: Metadata> Ringbuffer<M> {
                 if self.empty.load(Ordering::Relaxed) {
                     cold_path();
 
-                    let base_id = DescriptorId::base_id(self.descriptor_count);
+                    let base_id = DescriptorId::base_id().prev();
                     if descriptor_id_start == base_id {
                         return BASE_SEQUENCE;
                     }
@@ -372,7 +435,66 @@ impl<M: Metadata> Ringbuffer<M> {
     }
 
     fn update_last_finalized(&self) {
-        todo!()
+        let sequence = self.last_finalized_sequence.load(Ordering::Acquire);
+        loop {
+            let mut finalized_sequence = sequence;
+            let mut attempt_sequence = finalized_sequence.wrapping_add(1);
+
+            'outer: loop {
+                let new_finalized_sequence = loop {
+                    let expected_id = DescriptorId::new_truncating(attempt_sequence as usize);
+
+                    let descriptor = self.descriptor(expected_id);
+
+                    let start_state_id = descriptor.state_id.load(Ordering::Acquire);
+
+                    let loaded_sequence = descriptor.sequence.load(Ordering::Acquire);
+
+                    let end_state_id = descriptor.state_id.load(Ordering::Relaxed);
+                    if start_state_id != end_state_id {
+                        continue;
+                    };
+
+                    if end_state_id
+                        == DescriptorStateId::new(expected_id, DescriptorState::Finalized)
+                        && loaded_sequence == attempt_sequence
+                    {
+                        break loaded_sequence;
+                    }
+
+                    let first_sequence = self.first_sequence();
+                    if attempt_sequence < first_sequence {
+                        attempt_sequence = first_sequence;
+                    } else if end_state_id
+                        == DescriptorStateId::new(expected_id, DescriptorState::MissingData)
+                    {
+                        attempt_sequence = attempt_sequence.wrapping_add(1);
+                    } else {
+                        break 'outer;
+                    };
+                };
+
+                finalized_sequence = new_finalized_sequence;
+                attempt_sequence = new_finalized_sequence.wrapping_add(1);
+            }
+
+            if finalized_sequence == sequence {
+                return;
+            }
+
+            if self
+                .last_finalized_sequence
+                .compare_exchange_weak(
+                    sequence,
+                    finalized_sequence,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     fn descriptor(&self, id: DescriptorId) -> &Descriptor {
@@ -382,7 +504,14 @@ impl<M: Metadata> Ringbuffer<M> {
         unsafe { ptr.as_ref() }
     }
 
-    fn data(&self, logical: usize) -> NonNull<u8> {
+    fn metadata(&self, id: DescriptorId) -> &M::Atomic {
+        let index = id.to_raw() % self.descriptor_count;
+
+        let ptr = unsafe { self.metadata_buffer.add(index) };
+        unsafe { ptr.as_ref() }
+    }
+
+    fn data(&self, logical: usize) -> NonNull<AtomicU8> {
         let index = logical % self.data_capacity;
 
         unsafe { self.data_buffer.add(index) }
@@ -393,7 +522,7 @@ impl<M: Metadata> Ringbuffer<M> {
 pub struct ReservedMessage<'buffer, M: Metadata> {
     ringbuffer: &'buffer Ringbuffer<M>,
     sequence: u64,
-    buffer: &'buffer mut [u8],
+    buffer: &'buffer [AtomicU8],
 }
 
 impl<'buffer, M: Metadata> ReservedMessage<'buffer, M> {
@@ -402,24 +531,87 @@ impl<'buffer, M: Metadata> ReservedMessage<'buffer, M> {
         self.sequence
     }
 
-    /// Returns an immutable view of the [`Message`] buffer.
-    pub fn buffer(&self) -> &[u8] {
-        self.buffer
-    }
-
-    /// Returns a mutable view of the [`Message`] buffer.
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
+    /// Returns the [`Message`] buffer.
+    pub fn buffer(&self) -> &[AtomicU8] {
         self.buffer
     }
 
     /// Commits the [`Message`] and associated [`Metadata`] into the associated [`Ringbuffer`].
     pub fn commit(self, metadata: M) -> CommittedMessage<'buffer, M> {
-        todo!()
+        let ringbuffer = self.ringbuffer;
+        let sequence = self.sequence;
+        let id = DescriptorId::new_truncating(sequence as usize);
+
+        let descriptor = self.ringbuffer.descriptor(id);
+        let metadata_ref = self.ringbuffer.metadata(id);
+
+        drop(self);
+
+        M::store(metadata_ref, metadata, Ordering::Release);
+
+        let current_state_id = DescriptorStateId::new(id, DescriptorState::Reserved);
+        let new_state_id = DescriptorStateId::new(id, DescriptorState::Committed);
+        let result = descriptor.state_id.compare_exchange(
+            current_state_id,
+            new_state_id,
+            Ordering::AcqRel,
+            Ordering::Release,
+        );
+        if result.is_err() {
+            unreachable!()
+        }
+
+        let descriptor_id_start = ringbuffer.descriptor_id_start.load(Ordering::Acquire);
+        if descriptor_id_start != id {
+            let current_state_id = DescriptorStateId::new(id, DescriptorState::Committed);
+            let new_state_id = DescriptorStateId::new(id, DescriptorState::Finalized);
+
+            if descriptor
+                .state_id
+                .compare_exchange(
+                    current_state_id,
+                    new_state_id,
+                    Ordering::AcqRel,
+                    Ordering::Release,
+                )
+                .is_ok()
+            {
+                ringbuffer.update_last_finalized();
+            }
+        }
+
+        CommittedMessage {
+            ringbuffer,
+            sequence,
+            metadata,
+        }
     }
 
     /// Finalizes the [`Message`], which closes the editing window.
     pub fn finalize(self, metadata: M) {
-        todo!()
+        let ringbuffer = self.ringbuffer;
+        let sequence = self.sequence;
+        let id = DescriptorId::new_truncating(sequence as usize);
+
+        let descriptor = self.ringbuffer.descriptor(id);
+        let metadata_ref = self.ringbuffer.metadata(id);
+
+        drop(self);
+
+        M::store(metadata_ref, metadata, Ordering::Release);
+        let current_state_id = DescriptorStateId::new(id, DescriptorState::Reserved);
+        let new_state_id = DescriptorStateId::new(id, DescriptorState::Finalized);
+        let result = descriptor.state_id.compare_exchange(
+            current_state_id,
+            new_state_id,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        if result.is_err() {
+            unreachable!()
+        }
+
+        ringbuffer.update_last_finalized();
     }
 }
 
@@ -435,11 +627,6 @@ pub struct CommittedMessage<'buffer, M: Metadata> {
 impl<'buffer, M: Metadata> CommittedMessage<'buffer, M> {
     /// Attempts to reopen the [`CommittedMessage`] for additional manipulation.
     pub fn reopen(self, additional_size: usize) -> Result<(ReservedMessage<'buffer, M>, M), Self> {
-        todo!()
-    }
-
-    /// Finalizes the [`Message`], which closes the editing window.
-    pub fn finalize(self) {
         todo!()
     }
 }
@@ -612,8 +799,8 @@ impl DescriptorId {
         self.0
     }
 
-    const fn base_id(descriptor_count: usize) -> Self {
-        Self::new_truncating(0usize.wrapping_sub(descriptor_count))
+    const fn base_id() -> Self {
+        Self::new_truncating(0)
     }
 }
 
@@ -681,5 +868,28 @@ mod test {
         assert_eq!(buffer.first_valid_sequence(), BASE_SEQUENCE);
         assert_eq!(buffer.next_sequence(), BASE_SEQUENCE);
         assert_eq!(buffer.next_reserve_sequence(), BASE_SEQUENCE);
+    }
+
+    #[test]
+    pub fn reserve() {
+        let buffer = AllocatedRingBuffer::<TestMetadata>::new(2048, 4);
+
+        let message_text = b"Hello World!";
+        let metadata = TestMetadata(42);
+
+        let reservation = buffer.reserve(message_text.len()).unwrap();
+
+        assert_eq!(reservation.sequence(), 0);
+        for (buffer_byte, byte) in reservation.buffer().iter().zip(message_text.iter()) {
+            buffer_byte.store(*byte, Ordering::Relaxed);
+        }
+
+        reservation.finalize(metadata);
+
+        let mut text_buffer = [0; 8];
+        let message = buffer.read(0, &mut text_buffer).unwrap();
+
+        assert_eq!(message.buffer.unwrap(), message_text);
+        assert_eq!(message.metadata, metadata);
     }
 }
